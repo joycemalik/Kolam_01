@@ -582,7 +582,13 @@ def encode_cmd(args):
         svg_path = render_svg_fancy(bits, N=N, tile_bits=3,
                                     out_svg=args.out, tile_px=args.tile_px,
                                     margin_px=args.margin_px, stroke_px=args.stroke_px,
-                                    palette=args.palette, fractal_depth=args.fractal_depth)
+                                    palette=args.palette, fractal_depth=args.fractal_depth,
+                                    dot_opacity=args.dot_opacity)
+    elif args.style == "clean":
+        svg_path = render_svg_clean(bits, N=N, tile_bits=3,
+                                    out_svg=args.out, tile_px=args.tile_px,
+                                    margin_px=args.margin_px, stroke_px=args.stroke_px,
+                                    dot_opacity=args.dot_opacity)
     else:
         svg_path = render_svg(bits, N=N, tile_bits=3,
                               out_svg=args.out, tile_px=args.tile_px,
@@ -630,8 +636,9 @@ def build_parser():
     e.add_argument("--tile-px", type=int, default=42, help="tile size in pixels")
     e.add_argument("--margin-px", type=int, default=180, help="quiet margin in pixels")
     e.add_argument("--stroke-px", type=float, default=3.0, help="(kept for legacy renderer)")
-    e.add_argument("--style", choices=["basic","fancy"], default="fancy", help="visual style")
+    e.add_argument("--style", choices=["basic","fancy","clean"], default="fancy", help="visual style")
     e.add_argument("--palette", choices=["basic","indigo","vermilion","jade","royal"], default="basic")
+    e.add_argument("--dot-opacity", type=float, default=None, help="dot transparency (0.0-1.0, default varies by palette)")
     e.add_argument("--fractal-depth", type=int, default=1, help="0–2 tiny inner ropes")
     e.set_defaults(func=encode_cmd)
 
@@ -664,7 +671,7 @@ def choose_palette(name: str):
         "basic": {
             "bg0": "#ffffff", "bg1": "#ffffff",
             "rope_under": "#000000", "rope_over": "#000000",
-            "glow": "#333333", "dots": "#000000", "border": "#000000"
+            "glow": "#333333", "dots": "#666666", "border": "#000000"
         },
         "indigo": {
             "bg0": "#0f0f23", "bg1": "#1a1a2e",
@@ -939,6 +946,87 @@ def add_pulli_lattice(dwg, canvas, margin, size, spacing, color, opacity=0.25, r
                             stroke_width=0.5, opacity=0.6))
     canvas.add(g)
 
+def draw_tile_clean(dwg, g_art, g_decode, x, y, s, rot, dotbit,
+                    stroke_decode="black", decode_w=1.7, curvature=0.62):
+    """Draw clean style: single continuous line with proper alignment."""
+    half = s/2.0
+    cx, cy = x+half, y+half
+    
+    # Calculate precise connection points that align with grid
+    # These points are exactly at tile edges for perfect alignment
+    edge_offset = 0  # No offset - connect directly at edges
+    mids = [
+        (x + edge_offset, cy),         # Left edge
+        (cx, y + edge_offset),         # Top edge  
+        (x + s - edge_offset, cy),     # Right edge
+        (cx, y + s - edge_offset)      # Bottom edge
+    ]
+    
+    def rot_point(px, py, turns):
+        dx, dy = px-cx, py-cy
+        for _ in range(turns%4):
+            dx, dy = -dy, dx
+        return (cx+dx, cy+dy)
+
+    L,T,R,B = [rot_point(px,py,rot) for (px,py) in mids]
+
+    # Draw single continuous flowing line with perfect edge alignment
+    def clean_curve(p0, p1):
+        # Create a smooth curve that flows from edge to edge
+        # Control points create gentle curves without gaps
+        mid_x, mid_y = (p0[0] + p1[0])/2, (p0[1] + p1[1])/2
+        
+        # Subtle control points for smooth flow
+        ctrl_offset = s * 0.25  # Reduced for cleaner lines
+        
+        # Calculate control points for smooth S-curve
+        c1x = p0[0] + (mid_x - p0[0]) * 0.5 + (cy - mid_y) * 0.2
+        c1y = p0[1] + (mid_y - p0[1]) * 0.5 + (mid_x - cx) * 0.2
+        c2x = p1[0] + (mid_x - p1[0]) * 0.5 + (cy - mid_y) * 0.2  
+        c2y = p1[1] + (mid_y - p1[1]) * 0.5 + (mid_x - cx) * 0.2
+        
+        d = f"M {p0[0]:.2f},{p0[1]:.2f} C {c1x:.2f},{c1y:.2f} {c2x:.2f},{c2y:.2f} {p1[0]:.2f},{p1[1]:.2f}"
+        
+        # Single clean line - thicker for better visibility
+        path = dwg.path(d=d, fill="none", stroke="#000000",
+                       stroke_width=2.5, stroke_linecap="round", stroke_linejoin="round")
+        g_art.add(path)
+
+    # Draw the two main curves that define the kolam pattern
+    clean_curve(L, T)  # Left to Top
+    clean_curve(R, B)  # Right to Bottom
+
+    # Decodable layer - thin arcs for QR functionality
+    r = 0.95*half
+    def arc_cmd(a1, a2):
+        def pt(a):
+            rad = a*pi/180.0
+            return (cx + r*cos(rad), cy + r*sin(rad))
+        p0 = pt(a1); p1 = pt(a2)
+        return f"M {p0[0]:.2f},{p0[1]:.2f} A {r:.2f},{r:.2f} 0 0 1 {p1[0]:.2f},{p1[1]:.2f}"
+    
+    # Rotation mapping for decode layer
+    if rot == 0:
+        arcs = [(180,270),(0,90)]
+    elif rot == 1:
+        arcs = [(270,360),(90,180)]
+    elif rot == 2:
+        arcs = [(0,90),(180,270)]
+    else:
+        arcs = [(90,180),(270,360)]
+    
+    for a1,a2 in arcs:
+        path = dwg.path(d=arc_cmd(a1,a2), fill="none", stroke=stroke_decode,
+                        stroke_width=decode_w, stroke_linecap="round")
+        g_decode.add(path)
+    
+    if dotbit == 1:
+        # Decode layer: small black dot for QR functionality
+        g_decode.add(dwg.circle(center=(cx,cy), r=s*0.06, fill=stroke_decode))
+        
+        # Art layer: Simple dot with minimal decoration
+        g_art.add(dwg.circle(center=(cx,cy), r=s*0.04, fill="#000000"))
+
 def draw_tile_fancy(dwg, g_art, g_decode, x, y, s, rot, dotbit,
                     stroke_decode="black", decode_w=1.7, curvature=0.62, palette="basic"):
     """Draw both: pretty rope layer + thin decodable arcs + center dot on decode layer."""
@@ -1010,9 +1098,217 @@ def draw_tile_fancy(dwg, g_art, g_decode, x, y, s, rot, dotbit,
         
         g_art.add(pet)
 
+def draw_tile_fancy(dwg, g_art, g_decode, x, y, s, rot, dotbit,
+                    stroke_decode="black", decode_w=1.7, curvature=0.62, palette="basic"):
+    """Draw both: pretty rope layer + thin decodable arcs + center dot on decode layer."""
+    # Check if using simple mode
+    simple_mode = (palette == "basic")
+    
+    # pretty rope
+    draw_tile_rope(dwg, g_art, x, y, s, rot,
+                   curvature=curvature, grad="url(#ropegrad)",
+                   under_w=max(4.0, s*0.11), over_w=max(2.5, s*0.07), glow="url(#glow)",
+                   simple_mode=simple_mode)
+
+    # original decodable arcs (thin) — recreate with same geometry using quarter-ellipses
+    half = s/2; r = 0.95*half; cx, cy = x+half, y+half
+    def arc_cmd(a1, a2):
+        # convert degrees to end point on circle
+        def pt(a):
+            rad = a*pi/180.0
+            return (cx + r*cos(rad), cy + r*sin(rad))
+        p0 = pt(a1); p1 = pt(a2)
+        return f"M {p0[0]:.2f},{p0[1]:.2f} A {r:.2f},{r:.2f} 0 0 1 {p1[0]:.2f},{p1[1]:.2f}"
+    # rotation mapping
+    if rot == 0:
+        arcs = [(180,270),(0,90)]
+    elif rot == 1:
+        arcs = [(270,360),(90,180)]
+    elif rot == 2:
+        arcs = [(0,90),(180,270)]
+    else:
+        arcs = [(90,180),(270,360)]
+    for a1,a2 in arcs:
+        path = dwg.path(d=arc_cmd(a1,a2), fill="none", stroke=stroke_decode,
+                        stroke_width=decode_w, stroke_linecap="round")
+        g_decode.add(path)
+    if dotbit == 1:
+        # decode layer: keep small black dot
+        g_decode.add(dwg.circle(center=(cx,cy), r=s*0.06, fill=stroke_decode))
+        
+        # art layer: Traditional kolam lotus/star pattern around dot
+        pet = dwg.g(opacity=0.8)
+        
+        # Create multi-layered petal design
+        # Outer petals (8-fold)
+        rr_outer = s*0.22
+        for k in range(8):
+            ang = k*pi/4
+            x1, y1 = cx + rr_outer*cos(ang), cy + rr_outer*sin(ang)
+            x2, y2 = cx + (rr_outer*0.6)*cos(ang+pi/8), cy + (rr_outer*0.6)*sin(ang+pi/8)
+            x3, y3 = cx + (rr_outer*0.6)*cos(ang-pi/8), cy + (rr_outer*0.6)*sin(ang-pi/8)
+            
+            # Create traditional petal shape
+            dstar = f"M {cx:.2f},{cy:.2f} Q {x2:.2f},{y2:.2f} {x1:.2f},{y1:.2f} Q {x3:.2f},{y3:.2f} {cx:.2f},{cy:.2f}"
+            pet.add(dwg.path(d=dstar, fill="none", stroke="#000000", 
+                            stroke_width=max(0.6, s*0.015), stroke_linecap="round"))
+        
+        # Inner petals (4-fold)
+        rr_inner = s*0.12
+        for k in range(4):
+            ang = k*pi/2 + pi/4  # offset by 45 degrees
+            x1, y1 = cx + rr_inner*cos(ang), cy + rr_inner*sin(ang)
+            xq, yq = cx + (rr_inner*0.5)*cos(ang+pi/6), cy + (rr_inner*0.5)*sin(ang+pi/6)
+            dstar = f"M {cx:.2f},{cy:.2f} Q {xq:.2f},{yq:.2f} {x1:.2f},{y1:.2f}"
+            pet.add(dwg.path(d=dstar, fill="none", stroke="#000000", 
+                            stroke_width=max(0.4, s*0.01), stroke_linecap="round"))
+        
+        # Central ring
+        pet.add(dwg.circle(center=(cx,cy), r=s*0.08, fill="none", stroke="#000000", 
+                          stroke_width=max(0.5, s*0.012), opacity=0.6))
+        
+        g_art.add(pet)
+
+def render_svg_clean(grid_bits: List[int], N: int, tile_bits=3,
+                     out_svg="kolam.svg", tile_px=42, margin_px=180, stroke_px=3.0,
+                     dot_opacity=None):
+    """Clean renderer: sophisticated kolam patterns with just simple lines and dots."""
+    total_tiles = N*N
+    bits = grid_bits[: total_tiles*tile_bits] + [0]*max(0, total_tiles*tile_bits - len(grid_bits))
+
+    size = margin_px*2 + N*tile_px
+    dwg = svgwrite.Drawing(out_svg, size=(size, size))
+    
+    # Simple white background
+    bg = dwg.add(dwg.g())
+    bg.add(dwg.rect(insert=(0,0), size=(size,size), fill="#ffffff"))
+
+    # Simple black border
+    border = dwg.add(dwg.g())
+    border.add(dwg.rect(insert=(2,2), size=(size-4, size-4),
+                        stroke="#000000", fill="none", stroke_width=4))
+
+    # Simple finder circles (just black circles)
+    finder_r = margin_px*0.22
+    for c in [(margin_px*0.6, margin_px*0.6),
+              (size - margin_px*0.6, margin_px*0.6),
+              (margin_px*0.6, size - margin_px*0.6)]:
+        border.add(dwg.circle(center=c, r=finder_r, fill="#000000"))
+
+    # Simple dot lattice
+    dot_op = dot_opacity if dot_opacity is not None else 0.4
+    spacing = max(8, tile_px*0.4)
+    
+    g_dots = dwg.g(opacity=dot_op)
+    x0 = margin_px; x1 = size - margin_px
+    y0 = margin_px; y1 = size - margin_px
+    xs = int((x1-x0)/spacing)+1
+    ys = int((y1-y0)/spacing)+1
+    
+    for i in range(xs):
+        for j in range(ys):
+            x = x0 + i*spacing
+            y = y0 + j*spacing
+            # Simple small dots
+            g_dots.add(dwg.circle(center=(x,y), r=2, fill="#666666"))
+    border.add(g_dots)
+
+    # layers
+    g_art = dwg.add(dwg.g())       # kolam lines
+    g_decode = dwg.add(dwg.g())    # thin arcs that decoder will read
+
+    # tiles
+    k = 0
+    for r in range(N):
+        for c in range(N):
+            b0, b1, b2 = bits[k], bits[k+1], bits[k+2]
+            k += 3
+            rot = (b0<<1) | b1
+            x = margin_px + c*tile_px
+            y = margin_px + r*tile_px
+            draw_tile_clean(dwg, g_art, g_decode, x, y, tile_px, rot, b2, curvature=0.68)
+
+    # ---- second pass: simple connectors ----
+    # cache rotations to avoid recompute
+    rots = np.zeros((N,N), dtype=int)
+    k = 0
+    for r in range(N):
+        for c in range(N):
+            b0, b1, b2 = bits[k], bits[k+1], bits[k+2]
+            rots[r,c] = (b0<<1) | b1
+            k += 3
+
+    # Continuous flowing connectors
+    def draw_clean_connector(dwg, g_art, x, y, tile_px, side):
+        s = tile_px
+        half = s/2.0
+        cx, cy = x+half, y+half
+        
+        # No offset - connect directly at tile edges for perfect alignment
+        mids = [
+            (x, cy),           # Left edge (x=0)
+            (cx, y),           # Top edge (y=0)  
+            (x + s, cy),       # Right edge (x=s)
+            (cx, y + s)        # Bottom edge (y=s)
+        ]
+        px, py = mids[side]
+
+        normals = [(-1,0),(0,-1),(1,0),(0,1)]
+        nx, ny = normals[side]
+        
+        # Longer connector for better continuity
+        L = s*0.5  # Extended length
+        p0 = (px - nx*L/2, py - ny*L/2)
+        p1 = (px + nx*L/2, py + ny*L/2)
+        
+        # Smooth curved connector instead of straight line
+        # Create subtle curve for natural flow
+        tangents = [(0,-1),(1,0),(0,1),(-1,0)]
+        tx, ty = tangents[side]
+        
+        # Control points for gentle S-curve
+        cusp = L*0.15  # Subtle curvature
+        c0 = (px - nx*L*0.3 + tx*cusp, py - ny*L*0.3 + ty*cusp)
+        c1 = (px + nx*L*0.3 + tx*cusp, py + ny*L*0.3 + ty*cusp)
+        
+        d = f"M {p0[0]:.2f},{p0[1]:.2f} C {c0[0]:.2f},{c0[1]:.2f} {c1[0]:.2f},{c1[1]:.2f} {p1[0]:.2f},{p1[1]:.2f}"
+        
+        # Single flowing line matching tile stroke width
+        g_art.add(dwg.path(d=d, fill="none", stroke="#000000", 
+                          stroke_width=2.5, stroke_linecap="round", stroke_linejoin="round"))
+
+    # Horizontal neighbours
+    for r in range(N):
+        for c in range(N-1):
+            rotA = rots[r,c]; rotB = rots[r,c+1]
+            edgesA = _edges_for_rot(rotA)
+            edgesB = _edges_for_rot(rotB)
+            touchA = any(2 in p for p in edgesA)
+            touchB = any(0 in p for p in edgesB)
+            if touchA and touchB:
+                x = margin_px + c*tile_px
+                y = margin_px + r*tile_px
+                draw_clean_connector(dwg, g_art, x, y, tile_px, side=2)
+
+    # Vertical neighbours
+    for r in range(N-1):
+        for c in range(N):
+            rotA = rots[r,c]; rotB = rots[r+1,c]
+            edgesA = _edges_for_rot(rotA)
+            edgesB = _edges_for_rot(rotB)
+            touchA = any(3 in p for p in edgesA)
+            touchB = any(1 in p for p in edgesB)
+            if touchA and touchB:
+                x = margin_px + c*tile_px
+                y = margin_px + r*tile_px
+                draw_clean_connector(dwg, g_art, x, y, tile_px, side=3)
+
+    dwg.save()
+    return out_svg
+
 def render_svg_fancy(grid_bits: List[int], N: int, tile_bits=3,
                      out_svg="kolam.svg", tile_px=42, margin_px=180, stroke_px=3.0,
-                     palette="indigo", fractal_depth=0):
+                     palette="indigo", fractal_depth=0, dot_opacity=None):
     """Pretty renderer that keeps a thin, decodable layer on top."""
     total_tiles = N*N
     bits = grid_bits[: total_tiles*tile_bits] + [0]*max(0, total_tiles*tile_bits - len(grid_bits))
@@ -1039,13 +1335,16 @@ def render_svg_fancy(grid_bits: List[int], N: int, tile_bits=3,
         border.add(mandala(dwg, c, finder_r*0.78, strokes=18, stroke_width=1.2, stroke=pal["rope_over"]))
 
     # pulli lattice - make it more prominent for traditional look
-    if palette == "basic":
-        # For basic palette, make dots more prominent and darker
-        add_pulli_lattice(dwg, border, margin_px, size, spacing=max(8, tile_px*0.4),
-                          color=pal["dots"], opacity=1.0, r=max(3.0, tile_px*0.05))
+    # Determine dot opacity based on palette or user override
+    if dot_opacity is not None:
+        dot_op = dot_opacity
+    elif palette == "basic":
+        dot_op = 0.6  # Grey dots with moderate opacity for basic palette
     else:
-        add_pulli_lattice(dwg, border, margin_px, size, spacing=max(8, tile_px*0.4),
-                          color=pal["dots"], opacity=0.85, r=max(2.5, tile_px*0.04))
+        dot_op = 0.85  # Default for other palettes
+        
+    add_pulli_lattice(dwg, border, margin_px, size, spacing=max(8, tile_px*0.4),
+                      color=pal["dots"], opacity=dot_op, r=max(3.0, tile_px*0.05))
 
     # layers
     g_art = dwg.add(dwg.g())       # pretty rope underlay
