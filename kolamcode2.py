@@ -1,5 +1,5 @@
 import argparse, base64, binascii, json, math, os, sys
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 import numpy as np
 import cv2
 import svgwrite
@@ -7,6 +7,12 @@ from xml.etree import ElementTree as ET
 from PIL import Image
 import hashlib
 from math import cos, sin, pi
+import struct
+import hmac
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import secrets
 
 # Optional imports for SVG support
 CAIROSVG_AVAILABLE = False
@@ -80,34 +86,156 @@ def crc32(data: bytes) -> int:
     return binascii.crc32(data) & 0xffffffff
 
 # =========================
-# Layout constants
+# Enhanced QR Layout constants
 # =========================
-# We keep a quiet margin where finder circles and border live.
-# Grid: N x N tiles. Each tile encodes 3 bits: rot(2) + dot(1).
+# Enhanced QR-like structure with proper finder patterns, timing lines, and alignment marks
+# Grid: N x N modules with 4-module quiet margin
+# Each data module encodes 3 bits: rot(2) + dot(1) for kolam aesthetics
 
-def pack_header(n_tiles: int, text_len: int, version: int = 1) -> bytes:
+# QR-like structure constants
+QUIET_MARGIN = 4  # 4-module quiet zone
+FINDER_SIZE = 7   # 7x7 finder pattern
+TIMING_ROW = 6    # Row for horizontal timing pattern
+TIMING_COL = 6    # Column for vertical timing pattern
+
+def get_module_grid_size(data_modules: int) -> int:
+    """Calculate total module grid size including structure elements"""
+    # Find minimum N where (N-2*QUIET_MARGIN-structure_modules)^2 >= data_modules
+    # Structure: 3 finders (7x7), timing lines, alignment marks
+    structure_overhead = 3 * 49 + 20  # Rough estimate
+    data_area = data_modules + structure_overhead
+    n = max(21, int(math.sqrt(data_area)) + 2 * QUIET_MARGIN + 2)
+    return n if n % 2 == 1 else n + 1  # Prefer odd sizes
+
+def pack_header(n_modules: int, text_len: int, version: int = 2, has_stego: bool = False) -> bytes:
     """
-    Header: 1 byte version | 2 bytes N (grid) | 4 bytes text_len | 4 bytes CRC32(payload)
-    We'll put CRC over the raw text bytes (payload).
+    Enhanced header: 1 byte version | 2 bytes N (grid) | 4 bytes text_len | 1 byte flags | 4 bytes CRC32
     """
-    if n_tiles > 65535 or text_len > 0xFFFFFFFF:
-        raise ValueError("Too big.")
-    return bytes([
+    if n_modules > 65535 or text_len > 0xFFFFFFFF:
+        raise ValueError("Data too large")
+    flags = 0x01 if has_stego else 0x00
+    header = bytes([
         version,
-        (n_tiles >> 8) & 0xFF, n_tiles & 0xFF
-    ]) + text_len.to_bytes(4, 'big')
+        (n_modules >> 8) & 0xFF, n_modules & 0xFF
+    ]) + text_len.to_bytes(4, 'big') + bytes([flags])
+    return header
 
-def unpack_header(h: bytes) -> Tuple[int, int, int]:
-    if len(h) < 7:
+def unpack_header(h: bytes) -> Tuple[int, int, int, bool]:
+    if len(h) < 8:
         raise ValueError("Header too short")
     version = h[0]
-    n_tiles = (h[1] << 8) | h[2]
+    n_modules = (h[1] << 8) | h[2]
     text_len = int.from_bytes(h[3:7], 'big')
-    return version, n_tiles, text_len
+    has_stego = bool(h[7] & 0x01)
+    return version, n_modules, text_len, has_stego
 
 # =========================
-# Tile drawing (SVG)
+# QR Structure Functions
 # =========================
+
+def create_finder_pattern() -> np.ndarray:
+    """Create 7x7 finder pattern with proper ring ratios"""
+    pattern = np.zeros((7, 7), dtype=int)
+    # Outer 7x7 border (black)
+    pattern[0, :] = 1; pattern[6, :] = 1
+    pattern[:, 0] = 1; pattern[:, 6] = 1
+    # Inner 5x5 white space
+    pattern[1:6, 1:6] = 0
+    # Center 3x3 black square
+    pattern[2:5, 2:5] = 1
+    return pattern
+
+def create_alignment_pattern(size: int = 5) -> np.ndarray:
+    """Create alignment pattern"""
+    pattern = np.zeros((size, size), dtype=int)
+    # Outer border
+    pattern[0, :] = 1; pattern[size-1, :] = 1
+    pattern[:, 0] = 1; pattern[:, size-1] = 1
+    # Center dot
+    center = size // 2
+    pattern[center, center] = 1
+    return pattern
+
+def get_alignment_positions(n: int) -> List[Tuple[int, int]]:
+    """Calculate alignment mark positions for grid size n"""
+    if n < 25:
+        return []  # No alignment marks for small grids
+    
+    # Place alignment marks avoiding finder patterns and timing lines
+    positions = []
+    step = max(16, (n - 13) // 3)  # Adaptive spacing
+    
+    for row in range(6 + step, n - 6, step):
+        for col in range(6 + step, n - 6, step):
+            # Avoid finder pattern areas
+            if not ((row < 13 and col < 13) or  # Top-left
+                   (row < 13 and col > n-14) or  # Top-right  
+                   (row > n-14 and col < 13)):    # Bottom-left
+                positions.append((row, col))
+    return positions
+
+def place_structure_patterns(grid: np.ndarray) -> np.ndarray:
+    """Place finder patterns, timing lines, and alignment marks"""
+    n = grid.shape[0]
+    result = grid.copy()
+    
+    # Place finder patterns
+    finder = create_finder_pattern()
+    
+    # Top-left finder (with quiet zone)
+    result[QUIET_MARGIN:QUIET_MARGIN+7, QUIET_MARGIN:QUIET_MARGIN+7] = finder
+    
+    # Top-right finder
+    result[QUIET_MARGIN:QUIET_MARGIN+7, n-QUIET_MARGIN-7:n-QUIET_MARGIN] = finder
+    
+    # Bottom-left finder  
+    result[n-QUIET_MARGIN-7:n-QUIET_MARGIN, QUIET_MARGIN:QUIET_MARGIN+7] = finder
+    
+    # Timing patterns (alternating 1010...)
+    timing_start = QUIET_MARGIN + 8
+    timing_end = n - QUIET_MARGIN - 8
+    
+    # Horizontal timing line (row 6)
+    for col in range(timing_start, timing_end):
+        result[QUIET_MARGIN + TIMING_ROW, col] = col % 2
+    
+    # Vertical timing line (col 6)  
+    for row in range(timing_start, timing_end):
+        result[row, QUIET_MARGIN + TIMING_COL] = row % 2
+    
+    # Alignment patterns
+    alignment = create_alignment_pattern()
+    for row, col in get_alignment_positions(n):
+        r_start = row - 2; r_end = row + 3
+        c_start = col - 2; c_end = col + 3
+        if (r_start >= 0 and r_end <= n and c_start >= 0 and c_end <= n):
+            result[r_start:r_end, c_start:c_end] = alignment
+    
+    return result
+
+def is_data_module(row: int, col: int, n: int) -> bool:
+    """Check if a module position is available for data (not structure)"""
+    # Quiet zone
+    if (row < QUIET_MARGIN or row >= n - QUIET_MARGIN or 
+        col < QUIET_MARGIN or col >= n - QUIET_MARGIN):
+        return False
+    
+    # Finder patterns (7x7 each)
+    if ((row < QUIET_MARGIN + 7 and col < QUIET_MARGIN + 7) or  # Top-left
+        (row < QUIET_MARGIN + 7 and col >= n - QUIET_MARGIN - 7) or  # Top-right
+        (row >= n - QUIET_MARGIN - 7 and col < QUIET_MARGIN + 7)):   # Bottom-left
+        return False
+    
+    # Timing lines
+    if (row == QUIET_MARGIN + TIMING_ROW or col == QUIET_MARGIN + TIMING_COL):
+        return False
+    
+    # Alignment patterns
+    for a_row, a_col in get_alignment_positions(n):
+        if abs(row - a_row) <= 2 and abs(col - a_col) <= 2:
+            return False
+    
+    return True
 def draw_tile(dwg, group, x, y, s, rot, dotbit, stroke="black", stroke_width=2.0):
     """
     Kolam-like tile: two quarter arcs connecting midpoints.
