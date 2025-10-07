@@ -1,0 +1,13 @@
+[project]
+name = "svg-test"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "cairocffi>=1.7.1",
+    "cairosvg>=2.8.2",
+    "pillow>=11.3.0",
+    "reportlab>=4.4.4",
+    "svglib>=1.6.0",
+]
